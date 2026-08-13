@@ -41,8 +41,7 @@ async def _dm(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, **kwa
         log.warning("Не смог написать юзеру %s в личку (не жал /start боту?)", user_id)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
+def _start_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     groups = storage.list_groups(user_id)
     pending = storage.pending_channels(user_id)
 
@@ -59,10 +58,60 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             lines.append(f"• {g['label']}")
 
     buttons = [[InlineKeyboardButton("➕ Добавить VK-группу", callback_data="addgroup")]]
+    if groups:
+        buttons.append([InlineKeyboardButton("🗑 Управлять группами", callback_data="groups")])
     for cid, ch in pending.items():
         buttons.append([InlineKeyboardButton(f"🔗 Привязать канал «{ch['title']}»", callback_data=f"linkstart:{cid}")])
 
-    await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text, markup = _start_view(update.effective_user.id)
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+async def on_back_to_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    text, markup = _start_view(update.effective_user.id)
+    await query.edit_message_text(text, reply_markup=markup)
+
+
+async def on_groups_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    groups = storage.list_groups(user_id)
+    if not groups:
+        await query.edit_message_text("Групп пока нет. Добавь через /start.")
+        return
+
+    buttons = [[InlineKeyboardButton(f"❌ {g['label']}", callback_data=f"delgroup:{key}")] for key, g in groups.items()]
+    buttons.append([InlineKeyboardButton("‹ Назад", callback_data="backstart")])
+    await query.edit_message_text("Твои VK-группы. Нажми, чтобы удалить:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def on_delete_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, group_key = query.data.split(":", 1)
+    user_id = update.effective_user.id
+
+    group = storage.get_group(user_id, group_key)
+    if not group:
+        await query.edit_message_text("Уже удалено.")
+        return
+
+    unlinked = storage.remove_group(user_id, group_key)
+    text = f"Удалил «{group['label']}»."
+    if unlinked:
+        text += "\n\nЭти каналы остались без привязки (перепривяжи через /start): " + ", ".join(unlinked)
+
+    groups = storage.list_groups(user_id)
+    buttons = [[InlineKeyboardButton(f"❌ {g['label']}", callback_data=f"delgroup:{key}")] for key, g in groups.items()]
+    buttons.append([InlineKeyboardButton("‹ Назад", callback_data="backstart")])
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 VKTOKEN_HELP = (
@@ -327,6 +376,9 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(on_group_pick, pattern="^pick:"))
     app.add_handler(CallbackQueryHandler(on_start_linkchan, pattern="^linkstart:"))
     app.add_handler(CallbackQueryHandler(on_link_channel_pick, pattern="^linkpick:"))
+    app.add_handler(CallbackQueryHandler(on_groups_menu, pattern="^groups$"))
+    app.add_handler(CallbackQueryHandler(on_delete_group, pattern="^delgroup:"))
+    app.add_handler(CallbackQueryHandler(on_back_to_start, pattern="^backstart$"))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, on_channel_post))
     app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, on_forwarded))
