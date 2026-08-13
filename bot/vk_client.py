@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 
 import requests
 import vk_api
@@ -43,8 +44,10 @@ def upload_photos(token: str, group_id: int, paths: list[str]) -> list[str]:
     attachments = []
     for path in paths:
         with open(path, "rb") as f:
-            upload_result = requests.post(upload_url, files={"photo": f}, timeout=60).json()
+            files = {"photo": (Path(path).name, f, "image/jpeg")}
+            upload_result = requests.post(upload_url, files=files, timeout=60).json()
         if not upload_result.get("photo") or upload_result["photo"] == "[]":
+            log.warning("VK upload server empty response for %s (%d bytes): %s", path, Path(path).stat().st_size, upload_result)
             raise RuntimeError(f"VK upload server returned no photo: {upload_result}")
         saved = api.photos.saveWallPhoto(group_id=group_id, **upload_result)
         attachments.extend(f"photo{p['owner_id']}_{p['id']}" for p in saved)
