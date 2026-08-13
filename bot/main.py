@@ -174,10 +174,10 @@ async def add_group_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         info = await asyncio.to_thread(vk_client.group_info, token, group_id)
         await asyncio.to_thread(vk_client.check_wall_photo_upload, token, group_id)
     except Exception as exc:
-        log.warning("VK token/group capability check failed: %s", type(exc).__name__)
+        log.warning("VK token/group capability check failed: %s", exc)
         await update.message.reply_text(
-            "VK не разрешил загрузку фото в эту группу. Нужен пользовательский токен администратора, "
-            "полученный кнопкой бота, а не ключ доступа сообщества. Проверь также id группы и начни заново: /start"
+            f"VK не разрешил загрузку фото в эту группу: {exc}\n\n"
+            "Проверь, что ты админ этой группы и id указан верно, и начни заново: /start"
         )
         return ConversationHandler.END
 
