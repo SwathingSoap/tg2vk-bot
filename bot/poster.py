@@ -43,6 +43,10 @@ async def post_messages(messages: list[Message], context: ContextTypes.DEFAULT_T
                 path = await _download(context, m.animation.file_id, tmp, ".mp4")
                 att = await asyncio.to_thread(vk_client.upload_video, token, group_id, path, text[:100] or "gif")
                 other_attachments.append(att)
+            elif m.video_note:
+                path = await _download(context, m.video_note.file_id, tmp, ".mp4")
+                att = await asyncio.to_thread(vk_client.upload_video, token, group_id, path, text[:100] or "video")
+                other_attachments.append(att)
             elif m.document:
                 doc = m.document
                 suffix = Path(doc.file_name or "file").suffix or ".bin"

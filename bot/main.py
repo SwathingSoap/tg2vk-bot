@@ -443,7 +443,7 @@ def build_application() -> Application:
             BotCommand("groups", "Управление VK-группами"),
             BotCommand("vktoken", "Как получить VK-токен"),
         ])
-        app.create_task(_queue_worker())
+        asyncio.create_task(_queue_worker())
 
     app = Application.builder().token(config.TG_BOT_TOKEN).post_init(_post_init).build()
 

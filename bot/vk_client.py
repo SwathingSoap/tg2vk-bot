@@ -89,7 +89,11 @@ def post_to_wall(token: str, group_id: int, message: str, attachments: list[str]
     params = {"owner_id": -group_id, "from_group": 1, "message": message or ""}
     if attachments:
         params["attachments"] = ",".join(attachments)
-    result = api.wall.post(**params)
+    try:
+        result = api.wall.post(**params)
+    except Exception:
+        log.warning("wall.post failed, params: message=%r attachments=%r", params.get("message"), params.get("attachments"))
+        raise
     post_id = result["post_id"]
     log.info("Posted to VK wall: group_id=%s post_id=%s", group_id, post_id)
     return post_id
