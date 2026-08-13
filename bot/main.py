@@ -63,10 +63,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
 
 
+VKTOKEN_HELP = (
+    "VK не даёт заливать фото/видео/документы на стену сообщества по простому ключу доступа группы — "
+    "только по токену пользователя-админа этого сообщества. Как получить:\n\n"
+    "1. https://vk.com/apps?act=manage -> Создать приложение -> тип «Standalone-приложение». Скопируй ID приложения.\n"
+    "2. Собери ссылку, подставив свой ID вместо ID_ПРИЛОЖЕНИЯ:\n"
+    "https://oauth.vk.com/authorize?client_id=ID_ПРИЛОЖЕНИЯ&display=page&redirect_uri=https://oauth.vk.com/blank.html"
+    "&scope=wall,photos,video,docs,groups,offline&response_type=token&v=5.199\n"
+    "3. Открой её в браузере под тем VK-аккаунтом, который админ нужного сообщества, разреши доступ.\n"
+    "4. После редиректа в адресной строке будет что-то вроде "
+    "blank.html#access_token=ДЛИННАЯ_СТРОКА&expires_in=0&user_id=...\n"
+    "   Скопируй значение access_token — это и есть токен для бота."
+)
+
+
+async def vktoken_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(VKTOKEN_HELP, disable_web_page_preview=True)
+
+
 async def add_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    await query.message.reply_text("Пришли токен доступа VK-сообщества (Управление -> Работа с API -> Ключи доступа).")
+    await query.message.reply_text(
+        "Пришли VK user-токен с правами wall,photos,video,docs,groups (обычный ключ доступа сообщества "
+        "для фото/видео не подходит — так велит сам VK API). Как получить — /vktoken."
+    )
     return ASK_TOKEN
 
 
@@ -283,6 +304,7 @@ def build_application() -> Application:
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("vktoken", vktoken_help))
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(on_group_pick, pattern="^pick:"))
     app.add_handler(CallbackQueryHandler(on_start_linkchan, pattern="^linkstart:"))
