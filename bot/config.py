@@ -13,5 +13,5 @@ def _require(name: str) -> str:
 
 
 TG_BOT_TOKEN = _require("TG_BOT_TOKEN")
-ALBUM_COLLECT_DELAY = float(os.getenv("ALBUM_COLLECT_DELAY", "1.5"))
+ALBUM_COLLECT_DELAY = float(os.getenv("ALBUM_COLLECT_DELAY", "1.5").split("#")[0].strip())
 STORAGE_PATH = os.getenv("STORAGE_PATH", "data/storage.json")
