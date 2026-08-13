@@ -8,7 +8,7 @@ REPO_URL="${1:?Usage: setup_vps.sh <git-repo-url>}"
 APP_DIR="/opt/telegram-vk-bot"
 RUN_USER="${SUDO_USER:-$(id -un)}"
 
-apt-get update -y
+apt-get update -y || true   # не валимся, если сторонний репо (например, PHP) отдаёт битую подпись
 apt-get install -y python3 python3-venv git
 
 if [ -d "$APP_DIR/.git" ]; then
