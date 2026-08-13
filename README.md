@@ -48,8 +48,8 @@ venv/bin/python -m bot.main                # Windows: venv\Scripts\python -m bot
 На чистом Ubuntu/Debian VPS, под root:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<ТВОЙ_ЮЗЕР>/<ТВОЙ_РЕПО>/main/deploy/setup_vps.sh -o setup_vps.sh
-bash setup_vps.sh https://github.com/<ТВОЙ_ЮЗЕР>/<ТВОЙ_РЕПО>.git
+curl -fsSL https://raw.githubusercontent.com/SwathingSoap/tg2vk-bot/main/deploy/setup_vps.sh -o setup_vps.sh
+bash setup_vps.sh https://github.com/SwathingSoap/tg2vk-bot.git
 ```
 
 Скрипт: ставит python3/venv/git, клонирует репо в `/opt/telegram-vk-bot`, ставит венв и зависимости, копирует `deploy/telegram-vk-bot.service` в systemd.
