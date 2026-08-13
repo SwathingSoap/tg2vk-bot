@@ -52,7 +52,7 @@ curl -fsSL https://raw.githubusercontent.com/SwathingSoap/tg2vk-bot/main/deploy/
 bash setup_vps.sh https://github.com/SwathingSoap/tg2vk-bot.git
 ```
 
-Скрипт: ставит python3/venv/git, клонирует репо в `/opt/telegram-vk-bot`, ставит венв и зависимости, копирует `deploy/telegram-vk-bot.service` в systemd.
+Скрипт: ставит python3/venv/git, клонирует репо в `/opt/telegram-vk-bot`, ставит венв и зависимости, копирует `deploy/telegram-vk-bot.service` в systemd. Сервис настраивается на запуск от того юзера, который вызвал скрипт (просто под root -> `root`, через `sudo` от другого юзера -> тот юзер).
 
 После этого:
 
