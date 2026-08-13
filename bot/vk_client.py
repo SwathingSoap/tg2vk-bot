@@ -43,11 +43,15 @@ def upload_photos(token: str, group_id: int, paths: list[str]) -> list[str]:
 
     attachments = []
     for path in paths:
-        with open(path, "rb") as f:
-            files = {"photo": (Path(path).name, f, "image/jpeg")}
-            upload_result = requests.post(upload_url, files=files, timeout=60).json()
+        data = Path(path).read_bytes()
+        resp = requests.post(
+            upload_url,
+            files={"photo": (Path(path).name, data, "image/jpeg")},
+            timeout=60,
+        )
+        log.info("VK upload response status=%s bytes_sent=%d body=%s", resp.status_code, len(data), resp.text[:1000])
+        upload_result = resp.json()
         if not upload_result.get("photo") or upload_result["photo"] == "[]":
-            log.warning("VK upload server empty response for %s (%d bytes): %s", path, Path(path).stat().st_size, upload_result)
             raise RuntimeError(f"VK upload server returned no photo: {upload_result}")
         saved = api.photos.saveWallPhoto(group_id=group_id, **upload_result)
         attachments.extend(f"photo{p['owner_id']}_{p['id']}" for p in saved)
