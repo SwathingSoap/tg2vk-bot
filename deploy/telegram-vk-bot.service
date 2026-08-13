@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram -> VK repost bot
+After=network.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/opt/telegram-vk-bot
+EnvironmentFile=/opt/telegram-vk-bot/.env
+ExecStart=/opt/telegram-vk-bot/venv/bin/python -m bot.main
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
