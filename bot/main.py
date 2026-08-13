@@ -115,10 +115,13 @@ async def on_delete_group(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 VKTOKEN_HELP = (
-    "Нажми кнопку и разреши VK доступ. После перехода на blank.html скопируй всю ссылку "
-    "из адресной строки и пришли её боту (там будет ?code=...).\n\n"
+    "Нажми кнопку и разреши VK доступ. Открывай эту ссылку с сервера (например через SSH SOCKS-прокси: "
+    "`ssh -D 1080 -N root@<IP_VPS>`, в браузере включить SOCKS5 127.0.0.1:1080) — токен привяжется к IP "
+    "сервера и не будет требовать переавторизации оттуда.\n\n"
+    "После перехода на blank.html скопируй всю ссылку из адресной строки и пришли её боту "
+    "(можно прислать только значение access_token).\n\n"
     "Используй VK-аккаунт, который является администратором нужного сообщества. "
-    "Сообщение с кодом бот сразу удалит."
+    "Сообщение с токеном бот сразу удалит."
 )
 
 
@@ -145,27 +148,20 @@ async def add_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def add_group_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     raw = update.message.text
-    code = vk_auth.extract_code(raw)
+    token = vk_auth.extract_access_token(raw)
     try:
         await update.message.delete()
     except Exception:
-        log.warning("Не удалось удалить сообщение с VK-кодом пользователя %s", update.effective_user.id)
+        log.warning("Не удалось удалить сообщение с VK-токеном пользователя %s", update.effective_user.id)
 
-    if not code:
+    if not token:
         await update.effective_chat.send_message(
-            "Не нашёл code. Пришли всю ссылку из адресной строки после авторизации."
+            "Не нашёл access_token. Пришли всю ссылку из адресной строки после авторизации или сам токен."
         )
         return ASK_TOKEN
 
-    try:
-        token = await asyncio.to_thread(vk_auth.exchange_code, config.VK_CLIENT_ID, config.VK_CLIENT_SECRET, code)
-    except Exception as exc:
-        log.warning("VK code exchange failed: %s", exc)
-        await update.effective_chat.send_message(f"Не получилось обменять код на токен: {exc}\n\nПопробуй ещё раз: /start")
-        return ConversationHandler.END
-
     context.user_data["vk_token"] = token
-    await update.effective_chat.send_message("Токен получил. Теперь пришли id группы (число, без минуса).")
+    await update.effective_chat.send_message("Токен получил и удалил из чата. Теперь пришли id группы (число, без минуса).")
     return ASK_GROUP_ID
 
 
