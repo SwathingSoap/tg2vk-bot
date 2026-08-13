@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import logging
 import uuid
 from dataclasses import dataclass
@@ -50,7 +51,10 @@ class PostJob:
     status_message_id: int | None = None
 
 
-_post_queue: "asyncio.Queue[PostJob]" = asyncio.Queue()
+_seq_counter = itertools.count()
+# приоритет по номеру прибытия — иначе одиночные посты (встают в очередь сразу)
+# обгоняют альбомы (у них 1.5с debounce перед постановкой), хотя пришли позже.
+_post_queue: "asyncio.PriorityQueue[tuple[int, PostJob]]" = asyncio.PriorityQueue()
 
 
 async def _dm(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, **kwargs) -> None:
@@ -213,7 +217,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def _queue_worker() -> None:
     while True:
-        job = await _post_queue.get()
+        _seq, job = await _post_queue.get()
         try:
             await _process_job(job)
         except Exception:
@@ -235,9 +239,13 @@ async def _process_job(job: PostJob) -> None:
     await _set_status(job, f"⏳ Загружаю в «{job.group_label}»…")
     try:
         vk_post_id = await poster.post_messages(job.messages, job.context, job.token, job.group_id)
-    except Exception:
+    except Exception as exc:
         log.exception("Failed to post job")
-        await _set_status(job, f"❌ Не получилось отправить в «{job.group_label}», глянь логи на сервере.")
+        if "too big" in str(exc).lower():
+            text = f"❌ Не отправлено в «{job.group_label}»: файл больше 20 МБ — лимит Telegram Bot API на скачивание, тут не обойти."
+        else:
+            text = f"❌ Не получилось отправить в «{job.group_label}», глянь логи на сервере."
+        await _set_status(job, text)
         return
 
     link = f"https://vk.com/wall-{job.group_id}_{vk_post_id}"
@@ -245,6 +253,7 @@ async def _process_job(job: PostJob) -> None:
 
 
 async def _enqueue(
+    seq: int,
     messages: list[Message],
     context: ContextTypes.DEFAULT_TYPE,
     group: dict,
@@ -272,10 +281,10 @@ async def _enqueue(
     position = _post_queue.qsize()
     if position:
         await _set_status(job, f"🕐 В очереди ({position} перед тобой)…")
-    await _post_queue.put(job)
+    await _post_queue.put((seq, job))
 
 
-async def _resolve_and_post(messages: list[Message], context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+async def _resolve_and_post(seq: int, messages: list[Message], context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
     groups = storage.list_groups(user_id)
     if not groups:
         await _dm(context, user_id, "Сначала добавь VK-группу: /addgroup")
@@ -283,11 +292,11 @@ async def _resolve_and_post(messages: list[Message], context: ContextTypes.DEFAU
 
     if len(groups) == 1:
         group = next(iter(groups.values()))
-        await _enqueue(messages, context, group, user_id)
+        await _enqueue(seq, messages, context, group, user_id)
         return
 
     token = uuid.uuid4().hex
-    _pending_choices[token] = {"messages": messages, "context": context}
+    _pending_choices[token] = {"seq": seq, "messages": messages, "context": context}
     buttons = [[InlineKeyboardButton(g["label"], callback_data=f"pick:{token}:{key}")] for key, g in groups.items()]
     await _dm(context, user_id, "В какую VK-группу закинуть?", reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -297,7 +306,7 @@ async def _flush_forward_album(key: str) -> None:
     bundle = _pending_forward_albums.pop(key, None)
     if not bundle:
         return
-    await _resolve_and_post(bundle["messages"], bundle["context"], bundle["user_id"])
+    await _resolve_and_post(bundle["seq"], bundle["messages"], bundle["context"], bundle["user_id"])
 
 
 async def on_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -305,13 +314,13 @@ async def on_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = update.effective_user.id
 
     if not message.media_group_id:
-        await _resolve_and_post([message], context, user_id)
+        await _resolve_and_post(next(_seq_counter), [message], context, user_id)
         return
 
     key = f"{user_id}:{message.media_group_id}"
     bundle = _pending_forward_albums.get(key)
     if bundle is None:
-        bundle = {"messages": [], "context": context, "user_id": user_id, "task": None}
+        bundle = {"seq": next(_seq_counter), "messages": [], "context": context, "user_id": user_id, "task": None}
         _pending_forward_albums[key] = bundle
     bundle["messages"].append(message)
     if bundle["task"]:
@@ -333,7 +342,7 @@ async def on_group_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     await query.edit_message_text("🕐 В очереди…")
     await _enqueue(
-        bundle["messages"], bundle["context"], group, update.effective_user.id,
+        bundle["seq"], bundle["messages"], bundle["context"], group, update.effective_user.id,
         status_chat_id=query.message.chat_id, status_message_id=query.message.message_id,
     )
 
@@ -404,7 +413,7 @@ async def _flush_channel_album(key: str) -> None:
         messages=bundle["messages"], context=bundle["context"],
         token=group["token"], group_id=group["group_id"], group_label=group["label"],
     )
-    await _post_queue.put(job)
+    await _post_queue.put((bundle["seq"], job))
 
 
 async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -423,7 +432,7 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         key = f"{message.chat_id}:{message.media_group_id}"
         bundle = _pending_channel_albums.get(key)
         if bundle is None:
-            bundle = {"messages": [], "context": context, "group": group, "task": None}
+            bundle = {"seq": next(_seq_counter), "messages": [], "context": context, "group": group, "task": None}
             _pending_channel_albums[key] = bundle
         bundle["messages"].append(message)
         if bundle["task"]:
@@ -432,7 +441,7 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     job = PostJob(messages=[message], context=context, token=group["token"], group_id=group["group_id"], group_label=group["label"])
-    await _post_queue.put(job)
+    await _post_queue.put((next(_seq_counter), job))
 
 
 def build_application() -> Application:
