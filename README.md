@@ -41,16 +41,18 @@ venv/bin/python -m bot.main                # Windows: venv\Scripts\python -m bot
 
 ## 5. Деплой на VPS через GitHub Actions
 
+Гайд ниже — для работы под root (проще для одиночного VPS, без лишнего системного юзера).
+
 ### Первичный сетап VPS (один раз)
 
-На чистом Ubuntu/Debian VPS от root:
+На чистом Ubuntu/Debian VPS, под root:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/<ТВОЙ_ЮЗЕР>/<ТВОЙ_РЕПО>/main/deploy/setup_vps.sh -o setup_vps.sh
 bash setup_vps.sh https://github.com/<ТВОЙ_ЮЗЕР>/<ТВОЙ_РЕПО>.git
 ```
 
-Скрипт: ставит python3/venv/git, создаёт системного юзера `botuser`, клонирует репо в `/opt/telegram-vk-bot`, ставит venv и зависимости, копирует `deploy/telegram-vk-bot.service` в systemd.
+Скрипт: ставит python3/venv/git, клонирует репо в `/opt/telegram-vk-bot`, ставит венв и зависимости, копирует `deploy/telegram-vk-bot.service` в systemd.
 
 После этого:
 
@@ -61,14 +63,6 @@ systemctl status telegram-vk-bot
 journalctl -u telegram-vk-bot -f  # логи
 ```
 
-### Разрешить деплою рестартовать сервис без пароля
-
-```bash
-echo "botuser ALL=(root) NOPASSWD: /bin/systemctl restart telegram-vk-bot, /bin/systemctl status telegram-vk-bot" > /etc/sudoers.d/telegram-vk-bot
-```
-
-(если деплой по SSH идёт под тем же `botuser`, что владеет `/opt/telegram-vk-bot` — рекомендуется).
-
 ### Секреты в GitHub
 
 В репозитории: **Settings -> Secrets and variables -> Actions -> New repository secret**:
@@ -76,15 +70,13 @@ echo "botuser ALL=(root) NOPASSWD: /bin/systemctl restart telegram-vk-bot, /bin/
 | Secret | Значение |
 |---|---|
 | `VPS_HOST` | IP или домен VPS |
-| `VPS_USER` | пользователь для SSH (например `botuser`) |
-| `VPS_SSH_KEY` | приватный SSH-ключ (без пароля) для этого юзера |
+| `VPS_USER` | `root` |
+| `VPS_PASSWORD` | пароль root на VPS |
 | `VPS_PORT` | обычно `22` |
-
-Публичный ключ от этой пары должен быть в `~/.ssh/authorized_keys` у `VPS_USER` на VPS.
 
 ### Как деплоится дальше
 
-Любой `git push` в `main` триггерит `.github/workflows/deploy.yml`: заходит по SSH, `git pull`, ставит зависимости, рестартует `systemctl restart telegram-vk-bot`. Токены (`.env`) на VPS руками не трогаются деплоем — только код.
+Любой `git push` в `main` триггерит `.github/workflows/deploy.yml`: заходит по SSH под root (по паролю), `git pull`, ставит зависимости, рестартует `systemctl restart telegram-vk-bot`. Токены (`.env`) на VPS руками не трогаются деплоем — только код.
 
 ## Ограничения
 

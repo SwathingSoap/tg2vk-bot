@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=botuser
+User=root
 WorkingDirectory=/opt/telegram-vk-bot
 EnvironmentFile=/opt/telegram-vk-bot/.env
 ExecStart=/opt/telegram-vk-bot/venv/bin/python -m bot.main
