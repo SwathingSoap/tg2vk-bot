@@ -1,5 +1,6 @@
 import logging
 
+import requests
 import vk_api
 from vk_api.upload import VkUpload
 
@@ -28,10 +29,26 @@ def check_wall_photo_upload(token: str, group_id: int) -> None:
 
 
 def upload_photos(token: str, group_id: int, paths: list[str]) -> list[str]:
+    """Грузит фото по одному через photos.getWallUploadServer.
+
+    vk_api.upload.VkUpload.photo_wall шлёт файл в multipart-поле "file0", а этот
+    метод VK ждёт поле именно "photo" — с чужим именем сервер отдаёт пустой ответ
+    без ошибки, и saveWallPhoto потом падает с "photo is undefined". Поэтому руками.
+    """
     if not paths:
         return []
-    items = VkUpload(_session(token)).photo_wall(photos=paths, group_id=group_id)
-    return [f"photo{p['owner_id']}_{p['id']}" for p in items]
+    api = _session(token).get_api()
+    upload_url = api.photos.getWallUploadServer(group_id=group_id)["upload_url"]
+
+    attachments = []
+    for path in paths:
+        with open(path, "rb") as f:
+            upload_result = requests.post(upload_url, files={"photo": f}, timeout=60).json()
+        if not upload_result.get("photo") or upload_result["photo"] == "[]":
+            raise RuntimeError(f"VK upload server returned no photo: {upload_result}")
+        saved = api.photos.saveWallPhoto(group_id=group_id, **upload_result)
+        attachments.extend(f"photo{p['owner_id']}_{p['id']}" for p in saved)
+    return attachments
 
 
 def upload_video(token: str, group_id: int, path: str, name: str = "") -> str:
