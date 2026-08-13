@@ -1,8 +1,8 @@
 from urllib.parse import parse_qs, urlencode, urlparse
 
 
-VK_OAUTH_BASE_URL = "https://oauth.vk.com/authorize"
-VK_REDIRECT_URI = "https://oauth.vk.com/blank.html"
+VK_OAUTH_BASE_URL = "https://oauth.vk.ru/authorize"
+VK_REDIRECT_URI = "https://oauth.vk.ru/blank.html"
 VK_SCOPES = "wall,photos,video,docs,groups,offline"
 
 
