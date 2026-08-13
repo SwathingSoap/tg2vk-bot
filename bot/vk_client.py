@@ -22,6 +22,11 @@ def group_info(token: str, group_id: int) -> dict:
     return items[0]
 
 
+def check_wall_photo_upload(token: str, group_id: int) -> None:
+    """Проверяет, что токен реально может запросить загрузку фото на стену группы."""
+    _session(token).get_api().photos.getWallUploadServer(group_id=group_id)
+
+
 def upload_photos(token: str, group_id: int, paths: list[str]) -> list[str]:
     if not paths:
         return []

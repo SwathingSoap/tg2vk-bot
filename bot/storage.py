@@ -34,6 +34,24 @@ def get_group(user_id: int, group_key: str) -> dict | None:
     return list_groups(user_id).get(group_key)
 
 
+def remove_group(user_id: int, group_key: str) -> list[str]:
+    """Удаляет группу, отвязывает от неё каналы. Возвращает названия отвязанных каналов."""
+    data = _load()
+    user = data["users"].get(str(user_id))
+    if not user or group_key not in user["groups"]:
+        return []
+    user["groups"].pop(group_key)
+
+    unlinked = []
+    for ch in data["channels"].values():
+        if ch["user_id"] == user_id and ch["group_key"] == group_key:
+            ch["group_key"] = None
+            unlinked.append(ch["title"])
+
+    _save(data)
+    return unlinked
+
+
 def register_channel_pending(channel_id: int, user_id: int, title: str) -> None:
     """Канал добавлен (бот стал админом), но ещё не привязан к VK-группе."""
     data = _load()

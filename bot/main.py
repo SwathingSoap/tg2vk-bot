@@ -14,12 +14,14 @@ from telegram.ext import (
     filters,
 )
 
-from . import config, poster, storage, vk_client
+from . import config, poster, storage, vk_auth, vk_client
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# httpx пишет секретный Telegram bot token прямо в URL каждого Bot API запроса.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 ASK_TOKEN, ASK_GROUP_ID = range(2)
@@ -64,36 +66,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 VKTOKEN_HELP = (
-    "VK не даёт заливать фото/видео/документы на стену сообщества по простому ключу доступа группы — "
-    "только по токену пользователя-админа этого сообщества. Как получить:\n\n"
-    "1. https://vk.com/apps?act=manage -> Создать приложение -> тип «Standalone-приложение». Скопируй ID приложения.\n"
-    "2. Собери ссылку, подставив свой ID вместо ID_ПРИЛОЖЕНИЯ:\n"
-    "https://oauth.vk.com/authorize?client_id=ID_ПРИЛОЖЕНИЯ&display=page&redirect_uri=https://oauth.vk.com/blank.html"
-    "&scope=wall,photos,video,docs,groups,offline&response_type=token&v=5.199\n"
-    "3. Открой её в браузере под тем VK-аккаунтом, который админ нужного сообщества, разреши доступ.\n"
-    "4. После редиректа в адресной строке будет что-то вроде "
-    "blank.html#access_token=ДЛИННАЯ_СТРОКА&expires_in=0&user_id=...\n"
-    "   Скопируй значение access_token — это и есть токен для бота."
+    "Нажми кнопку и разреши VK доступ. После перехода на blank.html скопируй всю ссылку "
+    "из адресной строки и пришли её боту. Можно прислать только значение access_token.\n\n"
+    "Используй VK-аккаунт, который является администратором нужного сообщества. "
+    "Сообщение с токеном бот сразу удалит."
 )
 
 
+def _vk_token_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔐 Получить VK-токен", url=vk_auth.oauth_url(config.VK_CLIENT_ID))]]
+    )
+
+
 async def vktoken_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(VKTOKEN_HELP, disable_web_page_preview=True)
+    await update.message.reply_text(
+        VKTOKEN_HELP,
+        reply_markup=_vk_token_keyboard(),
+        disable_web_page_preview=True,
+    )
 
 
 async def add_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    await query.message.reply_text(
-        "Пришли VK user-токен с правами wall,photos,video,docs,groups (обычный ключ доступа сообщества "
-        "для фото/видео не подходит — так велит сам VK API). Как получить — /vktoken."
-    )
+    await query.message.reply_text(VKTOKEN_HELP, reply_markup=_vk_token_keyboard())
     return ASK_TOKEN
 
 
 async def add_group_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["vk_token"] = update.message.text.strip()
-    await update.message.reply_text("Теперь пришли id группы (число, без минуса).")
+    raw = update.message.text
+    token = vk_auth.extract_access_token(raw)
+    try:
+        await update.message.delete()
+    except Exception:
+        log.warning("Не удалось удалить сообщение с VK-токеном пользователя %s", update.effective_user.id)
+
+    if not token:
+        await update.effective_chat.send_message(
+            "Не нашёл access_token. Пришли всю ссылку из адресной строки после авторизации или сам токен."
+        )
+        return ASK_TOKEN
+
+    context.user_data["vk_token"] = token
+    await update.effective_chat.send_message("Токен получил и удалил из чата. Теперь пришли id группы (число, без минуса).")
     return ASK_GROUP_ID
 
 
@@ -107,10 +123,12 @@ async def add_group_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     group_id = int(raw)
     try:
         info = await asyncio.to_thread(vk_client.group_info, token, group_id)
+        await asyncio.to_thread(vk_client.check_wall_photo_upload, token, group_id)
     except Exception as exc:
-        log.warning("VK group check failed: %s", exc)
+        log.warning("VK token/group capability check failed: %s", type(exc).__name__)
         await update.message.reply_text(
-            "Не получилось проверить токен/id группы. Проверь права токена (стена, фото, видео, документы) и начни заново: /start"
+            "VK не разрешил загрузку фото в эту группу. Нужен пользовательский токен администратора, "
+            "полученный кнопкой бота, а не ключ доступа сообщества. Проверь также id группы и начни заново: /start"
         )
         return ConversationHandler.END
 
