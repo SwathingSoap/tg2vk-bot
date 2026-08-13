@@ -1,4 +1,5 @@
 import logging
+import time
 from pathlib import Path
 
 import requests
@@ -29,6 +30,28 @@ def check_wall_photo_upload(token: str, group_id: int) -> None:
     _session(token).get_api().photos.getWallUploadServer(group_id=group_id)
 
 
+def _upload_one_photo(upload_url: str, path: str, attempts: int = 3) -> dict:
+    """POST одного файла на upload_url. VK иногда молча отдаёт пустой photo при частых
+    подряд загрузках (throttling без явной ошибки) — при пустом ответе пробуем ещё раз."""
+    data = Path(path).read_bytes()
+    for attempt in range(1, attempts + 1):
+        resp = requests.post(
+            upload_url,
+            files={"photo": (Path(path).name, data, "image/jpeg")},
+            timeout=60,
+        )
+        upload_result = resp.json()
+        if upload_result.get("photo") and upload_result["photo"] != "[]":
+            return upload_result
+        log.warning(
+            "VK upload server empty photo (attempt %d/%d) status=%s body=%s",
+            attempt, attempts, resp.status_code, resp.text[:500],
+        )
+        if attempt < attempts:
+            time.sleep(1.5 * attempt)
+    raise RuntimeError(f"VK upload server returned no photo after {attempts} attempts: {upload_result}")
+
+
 def upload_photos(token: str, group_id: int, paths: list[str]) -> list[str]:
     """Грузит фото по одному через photos.getWallUploadServer.
 
@@ -43,18 +66,10 @@ def upload_photos(token: str, group_id: int, paths: list[str]) -> list[str]:
 
     attachments = []
     for path in paths:
-        data = Path(path).read_bytes()
-        resp = requests.post(
-            upload_url,
-            files={"photo": (Path(path).name, data, "image/jpeg")},
-            timeout=60,
-        )
-        log.info("VK upload response status=%s bytes_sent=%d body=%s", resp.status_code, len(data), resp.text[:1000])
-        upload_result = resp.json()
-        if not upload_result.get("photo") or upload_result["photo"] == "[]":
-            raise RuntimeError(f"VK upload server returned no photo: {upload_result}")
+        upload_result = _upload_one_photo(upload_url, path)
         saved = api.photos.saveWallPhoto(group_id=group_id, **upload_result)
         attachments.extend(f"photo{p['owner_id']}_{p['id']}" for p in saved)
+        time.sleep(0.5)
     return attachments
 
 
