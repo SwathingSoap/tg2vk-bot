@@ -49,6 +49,8 @@ class PostJob:
     group_label: str
     status_chat_id: int | None = None
     status_message_id: int | None = None
+    channel_owner_id: int | None = None
+    channel_title: str | None = None
 
 
 _seq_counter = itertools.count()
@@ -251,6 +253,12 @@ async def _process_job(job: PostJob) -> None:
     link = f"https://vk.com/wall-{job.group_id}_{vk_post_id}"
     await _set_status(job, f"✅ Опубликовано в «{job.group_label}»\n{link}")
 
+    if job.channel_owner_id is not None:
+        await _dm(
+            job.context, job.channel_owner_id,
+            f"Пост из канала «{job.channel_title}» опубликован в «{job.group_label}»\n{link}",
+        )
+
 
 async def _enqueue(
     seq: int,
@@ -412,6 +420,7 @@ async def _flush_channel_album(key: str) -> None:
     job = PostJob(
         messages=bundle["messages"], context=bundle["context"],
         token=group["token"], group_id=group["group_id"], group_label=group["label"],
+        channel_owner_id=bundle["owner_id"], channel_title=bundle["channel_title"],
     )
     await _post_queue.put((bundle["seq"], job))
 
@@ -432,7 +441,10 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         key = f"{message.chat_id}:{message.media_group_id}"
         bundle = _pending_channel_albums.get(key)
         if bundle is None:
-            bundle = {"seq": next(_seq_counter), "messages": [], "context": context, "group": group, "task": None}
+            bundle = {
+                "seq": next(_seq_counter), "messages": [], "context": context, "group": group, "task": None,
+                "owner_id": channel["user_id"], "channel_title": channel["title"],
+            }
             _pending_channel_albums[key] = bundle
         bundle["messages"].append(message)
         if bundle["task"]:
@@ -440,7 +452,10 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         bundle["task"] = asyncio.create_task(_flush_channel_album(key))
         return
 
-    job = PostJob(messages=[message], context=context, token=group["token"], group_id=group["group_id"], group_label=group["label"])
+    job = PostJob(
+        messages=[message], context=context, token=group["token"], group_id=group["group_id"], group_label=group["label"],
+        channel_owner_id=channel["user_id"], channel_title=channel["title"],
+    )
     await _post_queue.put((next(_seq_counter), job))
 
 
