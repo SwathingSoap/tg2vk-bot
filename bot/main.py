@@ -36,6 +36,17 @@ _pending_forward_albums: dict[str, dict] = {}
 _pending_channel_albums: dict[str, dict] = {}
 # ожидание выбора VK-группы кнопкой: token -> {"messages","context"}
 _pending_choices: dict[str, dict] = {}
+# одиночные (не альбомные) посты канала: "chat_id:message_id" -> id поста в VK.
+# None, пока пост ещё не улетел в VK (и channel_post, и edited_channel_post на публикацию
+# отложенного поста могут прийти на одно и то же сообщение — второй раз просто игнорим).
+# Когда id уже есть — следующий edited_channel_post на этот же message_id это правка
+# в Telegram, и мы правим тот же пост в VK, а не создаём новый.
+_channel_posts: dict[str, int | None] = {}
+_NOT_SEEN = object()  # маркер отсутствия ключа в _channel_posts, отличимый от значения None
+# альбомные сообщения канала, которые уже обработали: "chat_id:message_id" — правки внутри
+# альбома не поддерживаем (Telegram шлёт только изменившееся сообщение, не весь альбом),
+# поэтому повторные edited_channel_post на уже запощенный альбом просто игнорим.
+_seen_album_messages: set[str] = set()
 
 
 @dataclass
@@ -51,6 +62,8 @@ class PostJob:
     status_message_id: int | None = None
     channel_owner_id: int | None = None
     channel_title: str | None = None
+    post_identity: str | None = None
+    edit_vk_post_id: int | None = None
 
 
 _seq_counter = itertools.count()
@@ -238,11 +251,20 @@ async def _set_status(job: PostJob, text: str) -> None:
 
 
 async def _process_job(job: PostJob) -> None:
-    await _set_status(job, f"⏳ Загружаю в «{job.group_label}»…")
+    is_edit = job.edit_vk_post_id is not None
+    await _set_status(job, f"⏳ {'Обновляю' if is_edit else 'Загружаю'} в «{job.group_label}»…")
     try:
-        vk_post_id = await poster.post_messages(job.messages, job.context, job.token, job.group_id)
+        if is_edit:
+            await poster.edit_post(job.messages, job.context, job.token, job.group_id, job.edit_vk_post_id)
+            vk_post_id = job.edit_vk_post_id
+        else:
+            vk_post_id = await poster.post_messages(job.messages, job.context, job.token, job.group_id)
     except Exception as exc:
         log.exception("Failed to post job")
+        if is_edit and job.post_identity is not None:
+            _channel_posts[job.post_identity] = job.edit_vk_post_id  # правка не удалась, пост в VK остаётся прежним
+        elif job.post_identity is not None:
+            _channel_posts.pop(job.post_identity, None)  # публикация не удалась, дадим попробовать заново
         if "too big" in str(exc).lower():
             text = f"❌ Не отправлено в «{job.group_label}»: файл больше 20 МБ — лимит Telegram Bot API на скачивание, тут не обойти."
         else:
@@ -250,13 +272,17 @@ async def _process_job(job: PostJob) -> None:
         await _set_status(job, text)
         return
 
+    if job.post_identity is not None:
+        _channel_posts[job.post_identity] = vk_post_id
+
     link = f"https://vk.com/wall-{job.group_id}_{vk_post_id}"
-    await _set_status(job, f"✅ Опубликовано в «{job.group_label}»\n{link}")
+    await _set_status(job, f"{'✏️ Обновлено' if is_edit else '✅ Опубликовано'} в «{job.group_label}»\n{link}")
 
     if job.channel_owner_id is not None:
+        verb = "обновлён" if is_edit else "опубликован"
         await _dm(
             job.context, job.channel_owner_id,
-            f"Пост из канала «{job.channel_title}» опубликован в «{job.group_label}»\n{link}",
+            f"Пост из канала «{job.channel_title}» {verb} в «{job.group_label}»\n{link}",
         )
 
 
@@ -426,7 +452,9 @@ async def _flush_channel_album(key: str) -> None:
 
 
 async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.channel_post
+    # отложенный ("запланированный") пост при публикации приходит от Telegram как
+    # edited_channel_post, а не channel_post — ловим оба типа.
+    message = update.channel_post or update.edited_channel_post
     if message is None:
         return
 
@@ -438,6 +466,11 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if message.media_group_id:
+        member_key = f"{message.chat_id}:{message.message_id}"
+        if member_key in _seen_album_messages:
+            return  # уже запощен в составе альбома, правки альбомов не поддерживаем
+        _seen_album_messages.add(member_key)
+
         key = f"{message.chat_id}:{message.media_group_id}"
         bundle = _pending_channel_albums.get(key)
         if bundle is None:
@@ -452,9 +485,20 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         bundle["task"] = asyncio.create_task(_flush_channel_album(key))
         return
 
+    identity = f"{message.chat_id}:{message.message_id}"
+    existing = _channel_posts.get(identity, _NOT_SEEN)
+    if existing is None:
+        return  # публикация этого же поста уже в очереди/в процессе — не дублируем
+    if existing is _NOT_SEEN:
+        _channel_posts[identity] = None  # помечаем как "в процессе", пока не улетит в VK
+        edit_vk_post_id = None
+    else:
+        edit_vk_post_id = existing  # уже опубликован — это правка
+
     job = PostJob(
         messages=[message], context=context, token=group["token"], group_id=group["group_id"], group_label=group["label"],
         channel_owner_id=channel["user_id"], channel_title=channel["title"],
+        post_identity=identity, edit_vk_post_id=edit_vk_post_id,
     )
     await _post_queue.put((next(_seq_counter), job))
 
@@ -494,7 +538,9 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(on_delete_group, pattern="^delgroup:"))
     app.add_handler(CallbackQueryHandler(on_back_to_start, pattern="^backstart$"))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, on_channel_post))
+    app.add_handler(
+        MessageHandler(filters.UpdateType.CHANNEL_POST | filters.UpdateType.EDITED_CHANNEL_POST, on_channel_post)
+    )
     app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, on_forwarded))
     return app
 
@@ -502,7 +548,9 @@ def build_application() -> Application:
 def main() -> None:
     app = build_application()
     log.info("Bot started (multi-tenant mode)")
-    app.run_polling(allowed_updates=["channel_post", "message", "callback_query", "my_chat_member"])
+    app.run_polling(
+        allowed_updates=["channel_post", "edited_channel_post", "message", "callback_query", "my_chat_member"]
+    )
 
 
 if __name__ == "__main__":

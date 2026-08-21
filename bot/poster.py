@@ -23,8 +23,8 @@ async def _download(context: ContextTypes.DEFAULT_TYPE, file_id: str, dest_dir: 
     return path
 
 
-async def post_messages(messages: list[Message], context: ContextTypes.DEFAULT_TYPE, token: str, group_id: int) -> int:
-    """Скачивает медиа из одного или нескольких TG-сообщений (пост или альбом) и публикует одним постом в VK."""
+async def _build_post(messages: list[Message], context: ContextTypes.DEFAULT_TYPE, token: str, group_id: int) -> tuple[str, list[str]]:
+    """Скачивает медиа из одного или нескольких TG-сообщений (пост или альбом), грузит в VK. Возвращает (текст, attachments)."""
     text = _best_text(messages)
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -60,4 +60,17 @@ async def post_messages(messages: list[Message], context: ContextTypes.DEFAULT_T
         photo_attachments = await asyncio.to_thread(vk_client.upload_photos, token, group_id, photo_paths) if photo_paths else []
         attachments = photo_attachments + other_attachments
 
+    return text, attachments
+
+
+async def post_messages(messages: list[Message], context: ContextTypes.DEFAULT_TYPE, token: str, group_id: int) -> int:
+    text, attachments = await _build_post(messages, context, token, group_id)
     return await asyncio.to_thread(vk_client.post_to_wall, token, group_id, text, attachments)
+
+
+async def edit_post(
+    messages: list[Message], context: ContextTypes.DEFAULT_TYPE, token: str, group_id: int, vk_post_id: int
+) -> None:
+    """Пересобирает пост (текст + медиа) из отредактированного TG-сообщения и правит существующий пост в VK."""
+    text, attachments = await _build_post(messages, context, token, group_id)
+    await asyncio.to_thread(vk_client.edit_wall_post, token, group_id, vk_post_id, text, attachments)
