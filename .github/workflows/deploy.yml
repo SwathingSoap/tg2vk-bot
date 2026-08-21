@@ -19,7 +19,8 @@ jobs:
           script: |
             set -e
             cd /opt/telegram-vk-bot
-            git pull origin main
+            git fetch origin main
+            git reset --hard origin/main
             venv/bin/pip install -r requirements.txt
             systemctl restart telegram-vk-bot
             systemctl status telegram-vk-bot --no-pager
