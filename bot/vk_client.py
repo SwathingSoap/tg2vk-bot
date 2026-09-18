@@ -4,11 +4,21 @@ from pathlib import Path
 
 import requests
 import vk_api
+from vk_api.exceptions import ApiError
 from vk_api.upload import VkUpload
 
 log = logging.getLogger("vk_client")
 
+FLOOD_CONTROL = 9
+# VK отдаёт [9] Flood control на короткое окно; ждём и пробуем ещё раз. Очередь постов
+# однопоточная, так что сон здесь просто притормаживает следующий пост, ничего не теряя.
+FLOOD_RETRY_DELAYS = (10, 30, 90)
+# upload_url от photos.getWallUploadServer живёт часами, а сам метод VK лимитирует жёстко —
+# именно его дёрганье на каждый пост и приводило к [9] Flood control.
+UPLOAD_URL_TTL = 20 * 60
+
 _sessions: dict[str, vk_api.VkApi] = {}
+_upload_urls: dict[tuple[str, int], tuple[str, float]] = {}
 
 
 def _session(token: str) -> vk_api.VkApi:
@@ -17,39 +27,78 @@ def _session(token: str) -> vk_api.VkApi:
     return _sessions[token]
 
 
+def _call(method, name: str, **kwargs):
+    """Вызов метода VK с повтором на [9] Flood control и логом причины при провале."""
+    for delay in (*FLOOD_RETRY_DELAYS, None):
+        try:
+            return method(**kwargs)
+        except ApiError as exc:
+            if exc.code != FLOOD_CONTROL or delay is None:
+                log.exception("VK %s failed: %s", name, kwargs)
+                raise
+            log.warning("VK %s: flood control, повтор через %ss (%s)", name, delay, kwargs)
+            time.sleep(delay)
+        except Exception:
+            log.exception("VK %s failed: %s", name, kwargs)
+            raise
+
+
 def group_info(token: str, group_id: int) -> dict:
     """Проверяет токен и достаёт имя группы (для авто-лейбла при добавлении)."""
     api = _session(token).get_api()
-    result = api.groups.getById(group_id=group_id)
+    result = _call(api.groups.getById, "groups.getById", group_id=group_id)
     items = result["groups"] if isinstance(result, dict) else result
     return items[0]
 
 
 def check_wall_photo_upload(token: str, group_id: int) -> None:
     """Проверяет, что токен реально может запросить загрузку фото на стену группы."""
-    _session(token).get_api().photos.getWallUploadServer(group_id=group_id)
+    _wall_upload_url(token, group_id)
 
 
-def _upload_one_photo(upload_url: str, path: str, attempts: int = 3) -> dict:
-    """POST одного файла на upload_url. VK иногда молча отдаёт пустой photo при частых
-    подряд загрузках (throttling без явной ошибки) — при пустом ответе пробуем ещё раз."""
+def _wall_upload_url(token: str, group_id: int, refresh: bool = False) -> str:
+    key = (token, group_id)
+    cached = _upload_urls.get(key)
+    if not refresh and cached and time.time() - cached[1] < UPLOAD_URL_TTL:
+        return cached[0]
+
+    api = _session(token).get_api()
+    url = _call(api.photos.getWallUploadServer, "photos.getWallUploadServer", group_id=group_id)["upload_url"]
+    _upload_urls[key] = (url, time.time())
+    return url
+
+
+def _post_photo(upload_url: str, path: str) -> dict | None:
+    """POST одного файла на upload_url. Возвращает None, если сервер отдал пустой photo."""
     data = Path(path).read_bytes()
+    resp = requests.post(
+        upload_url,
+        files={"photo": (Path(path).name, data, "image/jpeg")},
+        timeout=60,
+    )
+    upload_result = resp.json()
+    if upload_result.get("photo") and upload_result["photo"] != "[]":
+        return upload_result
+    log.warning(
+        "VK upload server empty photo: path=%s status=%s body=%s",
+        path, resp.status_code, resp.text[:500],
+    )
+    return None
+
+
+def _upload_one_photo(token: str, group_id: int, path: str, attempts: int = 3) -> dict:
+    """VK иногда молча отдаёт пустой photo при частых подряд загрузках (throttling без явной
+    ошибки), а закешированный upload_url может успеть протухнуть — на пустой ответ берём
+    свежий upload_url и пробуем ещё раз."""
+    upload_url = _wall_upload_url(token, group_id)
     for attempt in range(1, attempts + 1):
-        resp = requests.post(
-            upload_url,
-            files={"photo": (Path(path).name, data, "image/jpeg")},
-            timeout=60,
-        )
-        upload_result = resp.json()
-        if upload_result.get("photo") and upload_result["photo"] != "[]":
+        upload_result = _post_photo(upload_url, path)
+        if upload_result is not None:
             return upload_result
-        log.warning(
-            "VK upload server empty photo (attempt %d/%d) status=%s body=%s",
-            attempt, attempts, resp.status_code, resp.text[:500],
-        )
         if attempt < attempts:
             time.sleep(1.5 * attempt)
-    raise RuntimeError(f"VK upload server returned no photo after {attempts} attempts: {upload_result}")
+            upload_url = _wall_upload_url(token, group_id, refresh=True)
+    raise RuntimeError(f"VK upload server returned no photo after {attempts} attempts: {path}")
 
 
 def _size(path: str) -> int | None:
@@ -69,20 +118,11 @@ def upload_photos(token: str, group_id: int, paths: list[str]) -> list[str]:
     if not paths:
         return []
     api = _session(token).get_api()
-    try:
-        upload_url = api.photos.getWallUploadServer(group_id=group_id)["upload_url"]
-    except Exception:
-        log.exception("VK getWallUploadServer failed: group_id=%s", group_id)
-        raise
 
     attachments = []
     for path in paths:
-        upload_result = _upload_one_photo(upload_url, path)
-        try:
-            saved = api.photos.saveWallPhoto(group_id=group_id, **upload_result)
-        except Exception:
-            log.exception("VK saveWallPhoto failed: group_id=%s path=%s size=%s", group_id, path, _size(path))
-            raise
+        upload_result = _upload_one_photo(token, group_id, path)
+        saved = _call(api.photos.saveWallPhoto, "photos.saveWallPhoto", group_id=group_id, **upload_result)
         attachments.extend(f"photo{p['owner_id']}_{p['id']}" for p in saved)
         time.sleep(0.5)
     return attachments
@@ -112,14 +152,7 @@ def post_to_wall(token: str, group_id: int, message: str, attachments: list[str]
     params = {"owner_id": -group_id, "from_group": 1, "message": message or ""}
     if attachments:
         params["attachments"] = ",".join(attachments)
-    try:
-        result = api.wall.post(**params)
-    except Exception:
-        log.exception(
-            "wall.post failed: group_id=%s message=%r attachments=%r",
-            group_id, params.get("message"), params.get("attachments"),
-        )
-        raise
+    result = _call(api.wall.post, "wall.post", **params)
     post_id = result["post_id"]
     log.info("Posted to VK wall: group_id=%s post_id=%s", group_id, post_id)
     return post_id
@@ -130,12 +163,5 @@ def edit_wall_post(token: str, group_id: int, post_id: int, message: str, attach
     params = {"owner_id": -group_id, "post_id": post_id, "message": message or ""}
     if attachments:
         params["attachments"] = ",".join(attachments)
-    try:
-        api.wall.edit(**params)
-    except Exception:
-        log.exception(
-            "wall.edit failed: group_id=%s post_id=%s message=%r attachments=%r",
-            group_id, post_id, params.get("message"), params.get("attachments"),
-        )
-        raise
+    _call(api.wall.edit, "wall.edit", **params)
     log.info("Edited VK wall post: group_id=%s post_id=%s", group_id, post_id)

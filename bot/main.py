@@ -287,6 +287,11 @@ async def _process_job(job: PostJob) -> None:
             _channel_posts.pop(job.post_identity, None)  # публикация не удалась, дадим попробовать заново
         if "too big" in str(exc).lower():
             text = f"❌ Не отправлено в «{job.group_label}»: файл больше 20 МБ — лимит Telegram Bot API на скачивание, тут не обойти."
+        elif "flood control" in str(exc).lower():
+            text = (
+                f"❌ Не отправлено в «{job.group_label}»: VK включил Flood control и не отпустил "
+                "за три попытки. Подожди и перешли пост заново."
+            )
         else:
             text = f"❌ Не получилось отправить в «{job.group_label}»:\n{_describe_error(exc)}"
         await _set_status(job, text)
