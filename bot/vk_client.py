@@ -52,6 +52,13 @@ def _upload_one_photo(upload_url: str, path: str, attempts: int = 3) -> dict:
     raise RuntimeError(f"VK upload server returned no photo after {attempts} attempts: {upload_result}")
 
 
+def _size(path: str) -> int | None:
+    try:
+        return Path(path).stat().st_size
+    except OSError:
+        return None
+
+
 def upload_photos(token: str, group_id: int, paths: list[str]) -> list[str]:
     """Грузит фото по одному через photos.getWallUploadServer.
 
@@ -62,24 +69,40 @@ def upload_photos(token: str, group_id: int, paths: list[str]) -> list[str]:
     if not paths:
         return []
     api = _session(token).get_api()
-    upload_url = api.photos.getWallUploadServer(group_id=group_id)["upload_url"]
+    try:
+        upload_url = api.photos.getWallUploadServer(group_id=group_id)["upload_url"]
+    except Exception:
+        log.exception("VK getWallUploadServer failed: group_id=%s", group_id)
+        raise
 
     attachments = []
     for path in paths:
         upload_result = _upload_one_photo(upload_url, path)
-        saved = api.photos.saveWallPhoto(group_id=group_id, **upload_result)
+        try:
+            saved = api.photos.saveWallPhoto(group_id=group_id, **upload_result)
+        except Exception:
+            log.exception("VK saveWallPhoto failed: group_id=%s path=%s size=%s", group_id, path, _size(path))
+            raise
         attachments.extend(f"photo{p['owner_id']}_{p['id']}" for p in saved)
         time.sleep(0.5)
     return attachments
 
 
 def upload_video(token: str, group_id: int, path: str, name: str = "") -> str:
-    item = VkUpload(_session(token)).video(video_file=path, name=name or "video", group_id=group_id)
+    try:
+        item = VkUpload(_session(token)).video(video_file=path, name=name or "video", group_id=group_id)
+    except Exception:
+        log.exception("VK video upload failed: group_id=%s path=%s size=%s", group_id, path, _size(path))
+        raise
     return f"video{item['owner_id']}_{item['video_id']}"
 
 
 def upload_document(token: str, group_id: int, path: str, name: str) -> str:
-    item = VkUpload(_session(token)).document_wall(doc=path, filename=name, group_id=group_id)
+    try:
+        item = VkUpload(_session(token)).document_wall(doc=path, filename=name, group_id=group_id)
+    except Exception:
+        log.exception("VK document upload failed: group_id=%s name=%r size=%s", group_id, name, _size(path))
+        raise
     doc = item["doc"] if "doc" in item else item
     return f"doc{doc['owner_id']}_{doc['id']}"
 
@@ -92,7 +115,10 @@ def post_to_wall(token: str, group_id: int, message: str, attachments: list[str]
     try:
         result = api.wall.post(**params)
     except Exception:
-        log.warning("wall.post failed, params: message=%r attachments=%r", params.get("message"), params.get("attachments"))
+        log.exception(
+            "wall.post failed: group_id=%s message=%r attachments=%r",
+            group_id, params.get("message"), params.get("attachments"),
+        )
         raise
     post_id = result["post_id"]
     log.info("Posted to VK wall: group_id=%s post_id=%s", group_id, post_id)
@@ -107,6 +133,9 @@ def edit_wall_post(token: str, group_id: int, post_id: int, message: str, attach
     try:
         api.wall.edit(**params)
     except Exception:
-        log.warning("wall.edit failed, params: post_id=%s message=%r attachments=%r", post_id, params.get("message"), params.get("attachments"))
+        log.exception(
+            "wall.edit failed: group_id=%s post_id=%s message=%r attachments=%r",
+            group_id, post_id, params.get("message"), params.get("attachments"),
+        )
         raise
     log.info("Edited VK wall post: group_id=%s post_id=%s", group_id, post_id)

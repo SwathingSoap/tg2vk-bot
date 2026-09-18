@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import tempfile
 from pathlib import Path
 
@@ -6,6 +7,8 @@ from telegram import Message
 from telegram.ext import ContextTypes
 
 from . import vk_client
+
+log = logging.getLogger("poster")
 
 
 def _best_text(messages: list[Message]) -> str:
@@ -17,9 +20,13 @@ def _best_text(messages: list[Message]) -> str:
 
 
 async def _download(context: ContextTypes.DEFAULT_TYPE, file_id: str, dest_dir: str, suffix: str) -> str:
-    tg_file = await context.bot.get_file(file_id)
-    path = str(Path(dest_dir) / f"{file_id}{suffix}")
-    await tg_file.download_to_drive(path)
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        path = str(Path(dest_dir) / f"{file_id}{suffix}")
+        await tg_file.download_to_drive(path)
+    except Exception:
+        log.exception("Telegram download failed: file_id=%s suffix=%s", file_id, suffix)
+        raise
     return path
 
 

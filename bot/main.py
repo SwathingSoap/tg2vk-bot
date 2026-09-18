@@ -246,8 +246,23 @@ async def _set_status(job: PostJob, text: str) -> None:
         return
     try:
         await job.context.bot.edit_message_text(text, chat_id=job.status_chat_id, message_id=job.status_message_id)
-    except Exception:
-        pass
+    except Exception as exc:
+        # "Message is not modified" — нормально (текст тот же), остальное стоит видеть в логах:
+        # без этого бот молча теряет статусы и выглядит как будто ничего не делает.
+        if "message is not modified" in str(exc).lower():
+            return
+        log.warning(
+            "Не смог обновить статус chat_id=%s message_id=%s: %s: %s",
+            job.status_chat_id, job.status_message_id, type(exc).__name__, exc,
+        )
+
+
+def _describe_error(exc: Exception) -> str:
+    """Короткое человекочитаемое описание ошибки для сообщения в Telegram."""
+    detail = str(exc).strip() or repr(exc)
+    if len(detail) > 500:
+        detail = detail[:500] + "…"
+    return f"{type(exc).__name__}: {detail}"
 
 
 async def _process_job(job: PostJob) -> None:
@@ -260,7 +275,12 @@ async def _process_job(job: PostJob) -> None:
         else:
             vk_post_id = await poster.post_messages(job.messages, job.context, job.token, job.group_id)
     except Exception as exc:
-        log.exception("Failed to post job")
+        log.exception(
+            "Failed to post job: group_id=%s label=%r is_edit=%s chat_id=%s message_ids=%s",
+            job.group_id, job.group_label, is_edit,
+            job.messages[0].chat_id if job.messages else None,
+            [m.message_id for m in job.messages],
+        )
         if is_edit and job.post_identity is not None:
             _channel_posts[job.post_identity] = job.edit_vk_post_id  # правка не удалась, пост в VK остаётся прежним
         elif job.post_identity is not None:
@@ -268,8 +288,12 @@ async def _process_job(job: PostJob) -> None:
         if "too big" in str(exc).lower():
             text = f"❌ Не отправлено в «{job.group_label}»: файл больше 20 МБ — лимит Telegram Bot API на скачивание, тут не обойти."
         else:
-            text = f"❌ Не получилось отправить в «{job.group_label}», глянь логи на сервере."
+            text = f"❌ Не получилось отправить в «{job.group_label}»:\n{_describe_error(exc)}"
         await _set_status(job, text)
+        if job.channel_owner_id is not None and job.status_message_id is None:
+            # пост из канала: статус-сообщения нет, а владелец должен узнать о провале,
+            # иначе бот "молча перестаёт отправлять".
+            await _dm(job.context, job.channel_owner_id, f"Пост из канала «{job.channel_title}» не ушёл.\n{text}")
         return
 
     if job.post_identity is not None:
