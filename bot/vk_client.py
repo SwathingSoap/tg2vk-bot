@@ -61,10 +61,10 @@ def check_wall_photo_upload(token: str, group_id: int) -> None:
 
 
 def _wall_upload_url(token: str, group_id: int) -> str:
-    """Свежий upload_url на каждый вызов.
+    """Берёт upload_url у VK — по одному на пост, не на каждое фото.
 
-    Кешировать его нельзя: VK не гарантирует срок жизни, а протухший url отдаёт
-    не ошибку, а пустой photo — и загрузка падает уже на saveWallPhoto.
+    Кешировать его между постами нельзя: VK не гарантирует срок жизни, а протухший
+    url отдаёт не ошибку, а пустой photo, и загрузка падает уже на saveWallPhoto.
     """
     api = _session(token).get_api()
     return _call(api.photos.getWallUploadServer, "photos.getWallUploadServer", group_id=group_id)["upload_url"]
@@ -88,17 +88,20 @@ def _post_photo(upload_url: str, path: str) -> dict | None:
     return None
 
 
-def _upload_one_photo(token: str, group_id: int, path: str, attempts: int = 3) -> dict:
+def _upload_one_photo(upload_url: str, path: str, attempts: int = 3) -> dict | None:
     """VK иногда молча отдаёт пустой photo при частых подряд загрузках (throttling без
-    явной ошибки) — на пустой ответ ждём и пробуем снова, каждый раз со свежим
-    upload_url."""
+    явной ошибки) — на пустой ответ ждём и пробуем снова на том же upload_url.
+
+    Брать новый upload_url под каждое фото нельзя: запросы разъезжаются по разным
+    upload-серверам, и VK начинает отдавать пустой photo на альбомах от трёх фото.
+    """
     for attempt in range(1, attempts + 1):
-        upload_result = _post_photo(_wall_upload_url(token, group_id), path)
+        upload_result = _post_photo(upload_url, path)
         if upload_result is not None:
             return upload_result
         if attempt < attempts:
             time.sleep(1.5 * attempt)
-    raise RuntimeError(f"VK upload server returned no photo after {attempts} attempts: {path}")
+    return None
 
 
 def _size(path: str) -> int | None:
@@ -118,10 +121,17 @@ def upload_photos(token: str, group_id: int, paths: list[str]) -> list[str]:
     if not paths:
         return []
     api = _session(token).get_api()
+    upload_url = _wall_upload_url(token, group_id)
 
     attachments = []
     for path in paths:
-        upload_result = _upload_one_photo(token, group_id, path)
+        upload_result = _upload_one_photo(upload_url, path)
+        if upload_result is None:
+            # Сервер мог протухнуть или закапризничать — один раз берём свежий и повторяем.
+            upload_url = _wall_upload_url(token, group_id)
+            upload_result = _upload_one_photo(upload_url, path)
+        if upload_result is None:
+            raise RuntimeError(f"VK upload server returned no photo for {path}")
         saved = _call(api.photos.saveWallPhoto, "photos.saveWallPhoto", group_id=group_id, **upload_result)
         attachments.extend(f"photo{p['owner_id']}_{p['id']}" for p in saved)
         time.sleep(0.5)
