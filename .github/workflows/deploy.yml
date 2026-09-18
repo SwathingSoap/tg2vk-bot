@@ -9,7 +9,23 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy over SSH
+      - uses: actions/checkout@v4
+
+      # Код заливаем с раннера, а не тянем с GitHub на сервере: тогда VPS не нужен
+      # доступ к репозиторию и репозиторий может быть приватным.
+      - name: Copy code to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: ${{ secrets.VPS_PORT }}
+          # .env и data/ не перечислены — их на сервере не трогаем.
+          source: "bot/,deploy/,requirements.txt,README.md"
+          target: /opt/telegram-vk-bot
+          overwrite: true
+
+      - name: Install deps and restart
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.VPS_HOST }}
@@ -19,8 +35,7 @@ jobs:
           script: |
             set -e
             cd /opt/telegram-vk-bot
-            git fetch origin main
-            git reset --hard origin/main
+            find . -name __pycache__ -type d -prune -exec rm -rf {} +
             venv/bin/pip install -r requirements.txt
             systemctl restart telegram-vk-bot
             systemctl status telegram-vk-bot --no-pager
