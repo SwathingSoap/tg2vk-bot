@@ -135,6 +135,33 @@ def upload_photos(token: str, group_id: int, paths: list[str]) -> list[str]:
     return attachments
 
 
+def diagnose(token: str, group_id: int) -> list[tuple[str, str]]:
+    """Дёргает ключевые методы VK и возвращает [(метод, результат)].
+
+    Мимо _call: нужен мгновенный ответ по каждому методу, а не повторы, и нужно
+    видеть, какие именно методы упёрлись в лимит, а какие живы.
+    """
+    api = _session(token).get_api()
+    checks = (
+        ("users.get", lambda: api.users.get()),
+        ("groups.getById", lambda: api.groups.getById(group_id=group_id)),
+        ("wall.get", lambda: api.wall.get(owner_id=-group_id, count=1)),
+        ("docs.getWallUploadServer", lambda: api.docs.getWallUploadServer(group_id=group_id)),
+        ("photos.getWallUploadServer", lambda: api.photos.getWallUploadServer(group_id=group_id)),
+    )
+    results: list[tuple[str, str]] = []
+    for name, fn in checks:
+        try:
+            fn()
+            results.append((name, "OK"))
+        except ApiError as exc:
+            msg = exc.error.get("error_msg", str(exc)) if isinstance(getattr(exc, "error", None), dict) else str(exc)
+            results.append((name, f"[{exc.code}] {msg}"))
+        except Exception as exc:
+            results.append((name, f"{type(exc).__name__}: {exc}"))
+    return results
+
+
 def _as_flood_control(exc: Exception, what: str) -> Exception:
     """VkUpload ходит в API мимо _call, так что [9] из него оборачиваем здесь."""
     if isinstance(exc, ApiError) and exc.code == FLOOD_CONTROL:

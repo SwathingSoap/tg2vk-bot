@@ -182,6 +182,23 @@ async def vktoken_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(VKTOKEN_HELP, reply_markup=_vk_token_keyboard(), disable_web_page_preview=True)
 
 
+async def vk_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает, какие методы VK живы, а какие упёрлись в лимит или права."""
+    groups = storage.list_groups(update.effective_user.id)
+    if not groups:
+        await update.message.reply_text("Групп пока нет. Добавь через /addgroup.")
+        return
+
+    msg = await update.message.reply_text("Проверяю VK…")
+    lines: list[str] = []
+    for g in groups.values():
+        results = await asyncio.to_thread(vk_client.diagnose, g["token"], g["group_id"])
+        lines.append(f"«{g['label']}» (id {g['group_id']})")
+        lines.extend(f"{'✅' if res == 'OK' else '❌'} {name}: {res}" for name, res in results)
+        lines.append("")
+    await msg.edit_text("\n".join(lines).strip())
+
+
 async def add_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await _reply(update, VKTOKEN_HELP, reply_markup=_vk_token_keyboard())
     return ASK_TOKEN
@@ -575,6 +592,7 @@ def build_application() -> Application:
             BotCommand("addgroup", "Добавить VK-группу"),
             BotCommand("groups", "Управление VK-группами"),
             BotCommand("vktoken", "Как получить VK-токен"),
+            BotCommand("vkcheck", "Проверить доступ к VK"),
         ])
         asyncio.create_task(_queue_worker())
 
@@ -595,6 +613,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("vktoken", vktoken_help))
     app.add_handler(CommandHandler("groups", groups_menu))
+    app.add_handler(CommandHandler("vkcheck", vk_check))
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(on_group_pick, pattern="^pick:"))
     app.add_handler(CallbackQueryHandler(on_start_linkchan, pattern="^linkstart:"))
