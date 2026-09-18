@@ -64,9 +64,15 @@ class PostJob:
     channel_title: str | None = None
     post_identity: str | None = None
     edit_vk_post_id: int | None = None
+    flood_attempt: int = 0  # сколько раз пост уже откладывали из-за VK flood control
 
 
 _seq_counter = itertools.count()
+# Окно flood control у VK длится час и дольше, поэтому пост не роняем, а откладываем
+# и пробуем снова. Паузы в секундах, по одной на попытку.
+FLOOD_RETRY_DELAYS = (15 * 60, 30 * 60, 60 * 60)
+# asyncio.create_task держит только слабую ссылку — без своего set таск может уехать в GC.
+_retry_tasks: set[asyncio.Task] = set()
 # приоритет по номеру прибытия — иначе одиночные посты (встают в очередь сразу)
 # обгоняют альбомы (у них 1.5с debounce перед постановкой), хотя пришли позже.
 _post_queue: "asyncio.PriorityQueue[tuple[int, PostJob]]" = asyncio.PriorityQueue()
@@ -257,6 +263,18 @@ async def _set_status(job: PostJob, text: str) -> None:
         )
 
 
+def _schedule_flood_retry(job: PostJob, delay: int) -> None:
+    """Возвращает пост в очередь через delay секунд, новым номером — в хвост."""
+
+    async def _retry() -> None:
+        await asyncio.sleep(delay)
+        await _post_queue.put((next(_seq_counter), job))
+
+    task = asyncio.create_task(_retry())
+    _retry_tasks.add(task)
+    task.add_done_callback(_retry_tasks.discard)
+
+
 def _describe_error(exc: Exception) -> str:
     """Короткое человекочитаемое описание ошибки для сообщения в Telegram."""
     detail = str(exc).strip() or repr(exc)
@@ -275,6 +293,23 @@ async def _process_job(job: PostJob) -> None:
         else:
             vk_post_id = await poster.post_messages(job.messages, job.context, job.token, job.group_id)
     except Exception as exc:
+        if isinstance(exc, vk_client.FloodControlError) and job.flood_attempt < len(FLOOD_RETRY_DELAYS):
+            # _channel_posts не трогаем: пост всё ещё "в процессе", повтор его доделает.
+            delay = FLOOD_RETRY_DELAYS[job.flood_attempt]
+            job.flood_attempt += 1
+            total = len(FLOOD_RETRY_DELAYS) + 1
+            log.warning(
+                "Flood control, откладываю пост на %ss: group_id=%s label=%r попытка %s из %s",
+                delay, job.group_id, job.group_label, job.flood_attempt + 1, total,
+            )
+            await _set_status(
+                job,
+                f"⏳ VK включил Flood control в «{job.group_label}».\n"
+                f"Повторю через {delay // 60} мин (попытка {job.flood_attempt + 1} из {total}).",
+            )
+            _schedule_flood_retry(job, delay)
+            return
+
         log.exception(
             "Failed to post job: group_id=%s label=%r is_edit=%s chat_id=%s message_ids=%s",
             job.group_id, job.group_label, is_edit,
@@ -288,9 +323,10 @@ async def _process_job(job: PostJob) -> None:
         if "too big" in str(exc).lower():
             text = f"❌ Не отправлено в «{job.group_label}»: файл больше 20 МБ — лимит Telegram Bot API на скачивание, тут не обойти."
         elif "flood control" in str(exc).lower():
+            waited = sum(FLOOD_RETRY_DELAYS) // 60
             text = (
-                f"❌ Не отправлено в «{job.group_label}»: VK включил Flood control и не отпустил "
-                "за три попытки. Подожди и перешли пост заново."
+                f"❌ Не отправлено в «{job.group_label}»: VK держит Flood control дольше {waited} мин. "
+                "Похоже, упёрлись в суточный лимит — перешли пост заново завтра."
             )
         else:
             text = f"❌ Не получилось отправить в «{job.group_label}»:\n{_describe_error(exc)}"

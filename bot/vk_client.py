@@ -10,9 +10,13 @@ from vk_api.upload import VkUpload
 log = logging.getLogger("vk_client")
 
 FLOOD_CONTROL = 9
-# VK отдаёт [9] Flood control на короткое окно; ждём и пробуем ещё раз. Очередь постов
-# однопоточная, так что сон здесь просто притормаживает следующий пост, ничего не теряя.
-FLOOD_RETRY_DELAYS = (10, 30, 90)
+# Короткий ретрай — только на случайный всплеск. Настоящее окно flood control у VK
+# длится час и дольше, его отрабатывает отложенный повтор задачи в main.
+FLOOD_RETRY_DELAYS = (10, 30)
+
+
+class FloodControlError(RuntimeError):
+    """VK ответил [9] Flood control и не отпустил за короткие повторы."""
 # upload_url от photos.getWallUploadServer живёт часами, а сам метод VK лимитирует жёстко —
 # именно его дёрганье на каждый пост и приводило к [9] Flood control.
 UPLOAD_URL_TTL = 20 * 60
@@ -33,9 +37,12 @@ def _call(method, name: str, **kwargs):
         try:
             return method(**kwargs)
         except ApiError as exc:
-            if exc.code != FLOOD_CONTROL or delay is None:
+            if exc.code != FLOOD_CONTROL:
                 log.exception("VK %s failed: %s", name, kwargs)
                 raise
+            if delay is None:
+                log.warning("VK %s: flood control не отпустил за короткие повторы", name)
+                raise FloodControlError(f"VK {name}: [9] Flood control") from exc
             log.warning("VK %s: flood control, повтор через %ss (%s)", name, delay, kwargs)
             time.sleep(delay)
         except Exception:
@@ -128,21 +135,28 @@ def upload_photos(token: str, group_id: int, paths: list[str]) -> list[str]:
     return attachments
 
 
+def _as_flood_control(exc: Exception, what: str) -> Exception:
+    """VkUpload ходит в API мимо _call, так что [9] из него оборачиваем здесь."""
+    if isinstance(exc, ApiError) and exc.code == FLOOD_CONTROL:
+        return FloodControlError(f"VK {what}: [9] Flood control")
+    return exc
+
+
 def upload_video(token: str, group_id: int, path: str, name: str = "") -> str:
     try:
         item = VkUpload(_session(token)).video(video_file=path, name=name or "video", group_id=group_id)
-    except Exception:
+    except Exception as exc:
         log.exception("VK video upload failed: group_id=%s path=%s size=%s", group_id, path, _size(path))
-        raise
+        raise _as_flood_control(exc, "video.save") from exc
     return f"video{item['owner_id']}_{item['video_id']}"
 
 
 def upload_document(token: str, group_id: int, path: str, name: str) -> str:
     try:
         item = VkUpload(_session(token)).document_wall(doc=path, filename=name, group_id=group_id)
-    except Exception:
+    except Exception as exc:
         log.exception("VK document upload failed: group_id=%s name=%r size=%s", group_id, name, _size(path))
-        raise
+        raise _as_flood_control(exc, "docs.getWallUploadServer") from exc
     doc = item["doc"] if "doc" in item else item
     return f"doc{doc['owner_id']}_{doc['id']}"
 
