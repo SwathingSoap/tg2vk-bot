@@ -17,12 +17,9 @@ FLOOD_RETRY_DELAYS = (10, 30)
 
 class FloodControlError(RuntimeError):
     """VK ответил [9] Flood control и не отпустил за короткие повторы."""
-# upload_url от photos.getWallUploadServer живёт часами, а сам метод VK лимитирует жёстко —
-# именно его дёрганье на каждый пост и приводило к [9] Flood control.
-UPLOAD_URL_TTL = 20 * 60
+
 
 _sessions: dict[str, vk_api.VkApi] = {}
-_upload_urls: dict[tuple[str, int], tuple[str, float]] = {}
 
 
 def _session(token: str) -> vk_api.VkApi:
@@ -63,16 +60,14 @@ def check_wall_photo_upload(token: str, group_id: int) -> None:
     _wall_upload_url(token, group_id)
 
 
-def _wall_upload_url(token: str, group_id: int, refresh: bool = False) -> str:
-    key = (token, group_id)
-    cached = _upload_urls.get(key)
-    if not refresh and cached and time.time() - cached[1] < UPLOAD_URL_TTL:
-        return cached[0]
+def _wall_upload_url(token: str, group_id: int) -> str:
+    """Свежий upload_url на каждый вызов.
 
+    Кешировать его нельзя: VK не гарантирует срок жизни, а протухший url отдаёт
+    не ошибку, а пустой photo — и загрузка падает уже на saveWallPhoto.
+    """
     api = _session(token).get_api()
-    url = _call(api.photos.getWallUploadServer, "photos.getWallUploadServer", group_id=group_id)["upload_url"]
-    _upload_urls[key] = (url, time.time())
-    return url
+    return _call(api.photos.getWallUploadServer, "photos.getWallUploadServer", group_id=group_id)["upload_url"]
 
 
 def _post_photo(upload_url: str, path: str) -> dict | None:
@@ -94,17 +89,15 @@ def _post_photo(upload_url: str, path: str) -> dict | None:
 
 
 def _upload_one_photo(token: str, group_id: int, path: str, attempts: int = 3) -> dict:
-    """VK иногда молча отдаёт пустой photo при частых подряд загрузках (throttling без явной
-    ошибки), а закешированный upload_url может успеть протухнуть — на пустой ответ берём
-    свежий upload_url и пробуем ещё раз."""
-    upload_url = _wall_upload_url(token, group_id)
+    """VK иногда молча отдаёт пустой photo при частых подряд загрузках (throttling без
+    явной ошибки) — на пустой ответ ждём и пробуем снова, каждый раз со свежим
+    upload_url."""
     for attempt in range(1, attempts + 1):
-        upload_result = _post_photo(upload_url, path)
+        upload_result = _post_photo(_wall_upload_url(token, group_id), path)
         if upload_result is not None:
             return upload_result
         if attempt < attempts:
             time.sleep(1.5 * attempt)
-            upload_url = _wall_upload_url(token, group_id, refresh=True)
     raise RuntimeError(f"VK upload server returned no photo after {attempts} attempts: {path}")
 
 
