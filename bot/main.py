@@ -1,6 +1,7 @@
 import asyncio
 import itertools
 import logging
+import tempfile
 import uuid
 from dataclasses import dataclass
 
@@ -27,7 +28,7 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
-ASK_TOKEN, ASK_GROUP_ID = range(2)
+ASK_TOKEN, ASK_GROUP_ID, ASK_MODTEST_PHOTO = range(3)
 
 VKHOST_URL = "https://vkhost.github.io/"
 
@@ -253,6 +254,39 @@ async def add_group_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     storage.add_group(update.effective_user.id, token, group_id, label)
     await update.message.reply_text(f"Готово, добавил «{label}».")
     return ConversationHandler.END
+
+
+async def modtest_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not moderation.enabled():
+        await update.message.reply_text("Проверка на 16+ выключена: на сервере не заданы ключи Sightengine.")
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "Тестовый режим проверки на 16+. Пришли картинку (можно несколько или переслать пост) — "
+        "покажу, что о ней думает Sightengine. В VK ничего не уйдёт.\n\nВыйти: /cancel"
+    )
+    return ASK_MODTEST_PHOTO
+
+
+async def modtest_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    message = update.message
+    file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = f"{tmp}/image"
+            tg_file = await context.bot.get_file(file_id)
+            await tg_file.download_to_drive(path)
+            nudity = await asyncio.to_thread(moderation.analyze, path)
+    except Exception as exc:
+        log.warning("modtest failed: %s: %s", type(exc).__name__, exc)
+        await message.reply_text(f"❌ Не смог проверить: {_describe_error(exc)}\n\nЕщё картинку или /cancel")
+        return ASK_MODTEST_PHOTO
+    await message.reply_text(f"{moderation.report(nudity)}\n\nЕщё картинку или /cancel")
+    return ASK_MODTEST_PHOTO
+
+
+async def modtest_not_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Это не картинка. Пришли фото или картинку файлом, выйти — /cancel")
+    return ASK_MODTEST_PHOTO
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -643,6 +677,7 @@ def build_application() -> Application:
             BotCommand("groups", "Управление VK-группами"),
             BotCommand("vktoken", "Как получить VK-токен"),
             BotCommand("vkcheck", "Проверить доступ к VK"),
+            BotCommand("modtest", "Тестовая проверка картинки на 16+"),
         ])
         asyncio.create_task(_queue_worker())
 
@@ -660,11 +695,25 @@ def build_application() -> Application:
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    # Пока юзер в тестовом режиме, его картинки и форварды забирает этот диалог,
+    # а не on_forwarded — поэтому в VK из теста ничего не уходит.
+    modtest = ConversationHandler(
+        entry_points=[CommandHandler("modtest", modtest_start)],
+        states={
+            ASK_MODTEST_PHOTO: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, modtest_photo),
+                MessageHandler(~filters.COMMAND, modtest_not_photo),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("vktoken", vktoken_help))
     app.add_handler(CommandHandler("groups", groups_menu))
     app.add_handler(CommandHandler("vkcheck", vk_check))
     app.add_handler(conv)
+    app.add_handler(modtest)
     app.add_handler(CallbackQueryHandler(on_group_pick, pattern="^pick:"))
     app.add_handler(CallbackQueryHandler(on_start_linkchan, pattern="^linkstart:"))
     app.add_handler(CallbackQueryHandler(on_link_channel_pick, pattern="^linkpick:"))
