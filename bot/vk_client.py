@@ -10,6 +10,7 @@ from vk_api.upload import VkUpload
 log = logging.getLogger("vk_client")
 
 FLOOD_CONTROL = 9
+POST_DELETED = 15
 # Короткий ретрай — только на случайный всплеск. Настоящее окно flood control у VK
 # длится час и дольше, его отрабатывает отложенный повтор задачи в main.
 FLOOD_RETRY_DELAYS = (10, 30)
@@ -17,6 +18,15 @@ FLOOD_RETRY_DELAYS = (10, 30)
 
 class FloodControlError(RuntimeError):
     """VK ответил [9] Flood control и не отпустил за короткие повторы."""
+
+
+class PostDeletedError(RuntimeError):
+    """Пост, который правим, в VK уже удалён — вручную или модерацией VK."""
+
+
+# Обрыв соединения или таймаут до VK — временная беда сети, а не отказ VK.
+# SSLError и ConnectTimeout — подклассы ConnectionError.
+NETWORK_ERRORS = (requests.ConnectionError, requests.Timeout)
 
 
 _sessions: dict[str, vk_api.VkApi] = {}
@@ -91,12 +101,20 @@ def _post_photo(upload_url: str, path: str) -> dict | None:
 def _upload_one_photo(upload_url: str, path: str, attempts: int = 3) -> dict | None:
     """VK иногда молча отдаёт пустой photo при частых подряд загрузках (throttling без
     явной ошибки) — на пустой ответ ждём и пробуем снова на том же upload_url.
+    Так же пережидаем обрывы до pu.vk.com (SSL EOF, write timeout); если сеть не
+    оживает за все попытки — ошибка сети летит наверх.
 
     Брать новый upload_url под каждое фото нельзя: запросы разъезжаются по разным
     upload-серверам, и VK начинает отдавать пустой photo на альбомах от трёх фото.
     """
     for attempt in range(1, attempts + 1):
-        upload_result = _post_photo(upload_url, path)
+        try:
+            upload_result = _post_photo(upload_url, path)
+        except NETWORK_ERRORS as exc:
+            if attempt == attempts:
+                raise
+            log.warning("VK upload network error, попытка %s из %s: %s: %s", attempt, attempts, type(exc).__name__, exc)
+            upload_result = None
         if upload_result is not None:
             return upload_result
         if attempt < attempts:
@@ -125,7 +143,10 @@ def upload_photos(token: str, group_id: int, paths: list[str]) -> list[str]:
 
     attachments = []
     for path in paths:
-        upload_result = _upload_one_photo(upload_url, path)
+        try:
+            upload_result = _upload_one_photo(upload_url, path)
+        except NETWORK_ERRORS:
+            upload_result = None
         if upload_result is None:
             # Сервер мог протухнуть или закапризничать — один раз берём свежий и повторяем.
             upload_url = _wall_upload_url(token, group_id)
@@ -196,7 +217,12 @@ def post_to_wall(token: str, group_id: int, message: str, attachments: list[str]
     params = {"owner_id": -group_id, "from_group": 1, "message": message or ""}
     if attachments:
         params["attachments"] = ",".join(attachments)
-    result = _call(api.wall.post, "wall.post", **params)
+    try:
+        result = _call(api.wall.post, "wall.post", **params)
+    except requests.ReadTimeout as exc:
+        # Запрос до VK дошёл, ответ — нет: пост мог и опубликоваться. Повтор задачи
+        # тут дал бы дубль на стене, поэтому это не ошибка сети, а отказ с объяснением.
+        raise RuntimeError("VK не ответил на wall.post — пост мог всё же опубликоваться, проверь стену") from exc
     post_id = result["post_id"]
     log.info("Posted to VK wall: group_id=%s post_id=%s", group_id, post_id)
     return post_id
@@ -207,5 +233,10 @@ def edit_wall_post(token: str, group_id: int, post_id: int, message: str, attach
     params = {"owner_id": -group_id, "post_id": post_id, "message": message or ""}
     if attachments:
         params["attachments"] = ",".join(attachments)
-    _call(api.wall.edit, "wall.edit", **params)
+    try:
+        _call(api.wall.edit, "wall.edit", **params)
+    except ApiError as exc:
+        if exc.code == POST_DELETED:
+            raise PostDeletedError(f"VK wall.edit: пост {post_id} удалён") from exc
+        raise
     log.info("Edited VK wall post: group_id=%s post_id=%s", group_id, post_id)

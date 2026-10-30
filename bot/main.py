@@ -5,6 +5,7 @@ import uuid
 from dataclasses import dataclass
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram.error import BadRequest, NetworkError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -16,7 +17,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import config, poster, storage, vk_auth, vk_client
+from . import config, moderation, poster, storage, vk_auth, vk_client
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,8 +42,11 @@ _pending_choices: dict[str, dict] = {}
 # отложенного поста могут прийти на одно и то же сообщение — второй раз просто игнорим).
 # Когда id уже есть — следующий edited_channel_post на этот же message_id это правка
 # в Telegram, и мы правим тот же пост в VK, а не создаём новый.
-_channel_posts: dict[str, int | None] = {}
+# _VK_DELETED — пост в VK удалён (вручную или модерацией VK): правки больше не переносим,
+# чтобы не долбить VK ошибкой [15] на каждую правку в Telegram.
+_channel_posts: dict[str, object] = {}
 _NOT_SEEN = object()  # маркер отсутствия ключа в _channel_posts, отличимый от значения None
+_VK_DELETED = object()
 # альбомные сообщения канала, которые уже обработали: "chat_id:message_id" — правки внутри
 # альбома не поддерживаем (Telegram шлёт только изменившееся сообщение, не весь альбом),
 # поэтому повторные edited_channel_post на уже запощенный альбом просто игнорим.
@@ -65,12 +69,15 @@ class PostJob:
     post_identity: str | None = None
     edit_vk_post_id: int | None = None
     flood_attempt: int = 0  # сколько раз пост уже откладывали из-за VK flood control
+    network_attempt: int = 0  # сколько раз пост уже откладывали из-за обрыва сети
 
 
 _seq_counter = itertools.count()
 # Окно flood control у VK длится час и дольше, поэтому пост не роняем, а откладываем
 # и пробуем снова. Паузы в секундах, по одной на попытку.
 FLOOD_RETRY_DELAYS = (15 * 60, 30 * 60, 60 * 60)
+# Обрывы сети до VK/Telegram (SSL EOF, write timeout) обычно проходят за минуты.
+NETWORK_RETRY_DELAYS = (60, 5 * 60)
 # asyncio.create_task держит только слабую ссылку — без своего set таск может уехать в GC.
 _retry_tasks: set[asyncio.Task] = set()
 # приоритет по номеру прибытия — иначе одиночные посты (встают в очередь сразу)
@@ -280,7 +287,7 @@ async def _set_status(job: PostJob, text: str) -> None:
         )
 
 
-def _schedule_flood_retry(job: PostJob, delay: int) -> None:
+def _schedule_retry(job: PostJob, delay: int) -> None:
     """Возвращает пост в очередь через delay секунд, новым номером — в хвост."""
 
     async def _retry() -> None:
@@ -290,6 +297,13 @@ def _schedule_flood_retry(job: PostJob, delay: int) -> None:
     task = asyncio.create_task(_retry())
     _retry_tasks.add(task)
     task.add_done_callback(_retry_tasks.discard)
+
+
+def _is_network_error(exc: Exception) -> bool:
+    # BadRequest в python-telegram-bot — подкласс NetworkError, но это отказ, а не сеть.
+    if isinstance(exc, NetworkError) and not isinstance(exc, BadRequest):
+        return True
+    return isinstance(exc, vk_client.NETWORK_ERRORS)
 
 
 def _describe_error(exc: Exception) -> str:
@@ -324,7 +338,36 @@ async def _process_job(job: PostJob) -> None:
                 f"⏳ VK включил Flood control в «{job.group_label}».\n"
                 f"Повторю через {delay // 60} мин (попытка {job.flood_attempt + 1} из {total}).",
             )
-            _schedule_flood_retry(job, delay)
+            _schedule_retry(job, delay)
+            return
+
+        if _is_network_error(exc) and job.network_attempt < len(NETWORK_RETRY_DELAYS):
+            delay = NETWORK_RETRY_DELAYS[job.network_attempt]
+            job.network_attempt += 1
+            total = len(NETWORK_RETRY_DELAYS) + 1
+            log.warning(
+                "Сеть сбоит, откладываю пост на %ss: group_id=%s label=%r попытка %s из %s: %s: %s",
+                delay, job.group_id, job.group_label, job.network_attempt + 1, total, type(exc).__name__, exc,
+            )
+            await _set_status(
+                job,
+                f"⏳ Связь с VK оборвалась при отправке в «{job.group_label}».\n"
+                f"Повторю через {delay // 60} мин (попытка {job.network_attempt + 1} из {total}).",
+            )
+            _schedule_retry(job, delay)
+            return
+
+        if isinstance(exc, vk_client.PostDeletedError):
+            log.info("VK post deleted, skip edit: group_id=%s post_id=%s", job.group_id, job.edit_vk_post_id)
+            if job.post_identity is not None:
+                _channel_posts[job.post_identity] = _VK_DELETED
+            text = (
+                f"ℹ️ Правку не перенёс в «{job.group_label}»: пост в VK удалён "
+                "(вручную или модерацией VK). Дальнейшие правки этого поста бот пропустит."
+            )
+            await _set_status(job, text)
+            if job.channel_owner_id is not None and job.status_message_id is None:
+                await _dm(job.context, job.channel_owner_id, f"Пост из канала «{job.channel_title}».\n{text}")
             return
 
         log.exception(
@@ -337,7 +380,12 @@ async def _process_job(job: PostJob) -> None:
             _channel_posts[job.post_identity] = job.edit_vk_post_id  # правка не удалась, пост в VK остаётся прежним
         elif job.post_identity is not None:
             _channel_posts.pop(job.post_identity, None)  # публикация не удалась, дадим попробовать заново
-        if "too big" in str(exc).lower():
+        if isinstance(exc, moderation.ModerationBlocked):
+            text = (
+                f"🔞 Не отправлено в «{job.group_label}»: картинка {exc.index} похожа на 16+ — "
+                f"{exc.label}, уверенность {exc.score:.0%}. Пост пропущен целиком."
+            )
+        elif "too big" in str(exc).lower():
             text = f"❌ Не отправлено в «{job.group_label}»: файл больше 20 МБ — лимит Telegram Bot API на скачивание, тут не обойти."
         elif "flood control" in str(exc).lower():
             waited = sum(FLOOD_RETRY_DELAYS) // 60
@@ -571,6 +619,8 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     existing = _channel_posts.get(identity, _NOT_SEEN)
     if existing is None:
         return  # публикация этого же поста уже в очереди/в процессе — не дублируем
+    if existing is _VK_DELETED:
+        return  # пост в VK удалён — правки не переносим
     if existing is _NOT_SEEN:
         _channel_posts[identity] = None  # помечаем как "в процессе", пока не улетит в VK
         edit_vk_post_id = None
@@ -632,6 +682,10 @@ def build_application() -> Application:
 def main() -> None:
     app = build_application()
     log.info("Bot started (multi-tenant mode)")
+    if moderation.enabled():
+        log.info("Проверка картинок на 16+ включена (Sightengine, порог %.2f)", config.MODERATION_THRESHOLD)
+    else:
+        log.warning("Проверка картинок на 16+ выключена: не заданы SIGHTENGINE_API_USER/SIGHTENGINE_API_SECRET")
     app.run_polling(
         allowed_updates=["channel_post", "edited_channel_post", "message", "callback_query", "my_chat_member"]
     )

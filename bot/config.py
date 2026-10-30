@@ -28,3 +28,7 @@ def _optional(name: str, default: str) -> str:
 TG_BOT_TOKEN = _require("TG_BOT_TOKEN")
 ALBUM_COLLECT_DELAY = float(_optional("ALBUM_COLLECT_DELAY", "1.5"))
 STORAGE_PATH = _optional("STORAGE_PATH", "data/storage.json")
+# Проверка картинок на 16+ через Sightengine. Без ключей проверка выключена.
+SIGHTENGINE_API_USER = _optional("SIGHTENGINE_API_USER", "")
+SIGHTENGINE_API_SECRET = _optional("SIGHTENGINE_API_SECRET", "")
+MODERATION_THRESHOLD = float(_optional("MODERATION_THRESHOLD", "0.5"))

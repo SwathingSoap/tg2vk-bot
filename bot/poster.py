@@ -6,7 +6,7 @@ from pathlib import Path
 from telegram import Message
 from telegram.ext import ContextTypes
 
-from . import vk_client
+from . import moderation, vk_client
 
 log = logging.getLogger("poster")
 
@@ -30,30 +30,42 @@ async def _download(context: ContextTypes.DEFAULT_TYPE, file_id: str, dest_dir: 
     return path
 
 
+class EmptyPostError(RuntimeError):
+    """В посте нет ни текста, ни медиа, которые бот умеет перенести в VK.
+
+    Без этой проверки VK отвечает невнятным "[100] invalid message param".
+    """
+
+
+def _describe_kinds(messages: list[Message]) -> str:
+    kinds = {type(m.effective_attachment).__name__ for m in messages if m.effective_attachment is not None}
+    return ", ".join(sorted(kinds)) or "пустое сообщение"
+
+
 async def _build_post(messages: list[Message], context: ContextTypes.DEFAULT_TYPE, token: str, group_id: int) -> tuple[str, list[str]]:
-    """Скачивает медиа из одного или нескольких TG-сообщений (пост или альбом), грузит в VK. Возвращает (текст, attachments)."""
+    """Скачивает медиа из одного или нескольких TG-сообщений (пост или альбом), грузит в VK. Возвращает (текст, attachments).
+
+    Сначала всё скачивает и проверяет фото на 16+, и только потом грузит в VK: иначе
+    видео из заблокированного поста успело бы осесть в видеозаписях группы.
+    """
     text = _best_text(messages)
 
     with tempfile.TemporaryDirectory() as tmp:
         photo_paths: list[str] = []
-        other_attachments: list[str] = []
+        other_uploads: list[tuple] = []  # (функция загрузки в VK, её аргументы)
 
         for m in messages:
             if m.photo:
-                path = await _download(context, m.photo[-1].file_id, tmp, ".jpg")
-                photo_paths.append(path)
+                photo_paths.append(await _download(context, m.photo[-1].file_id, tmp, ".jpg"))
             elif m.video:
                 path = await _download(context, m.video.file_id, tmp, ".mp4")
-                att = await asyncio.to_thread(vk_client.upload_video, token, group_id, path, text[:100] or "video")
-                other_attachments.append(att)
+                other_uploads.append((vk_client.upload_video, token, group_id, path, text[:100] or "video"))
             elif m.animation:
                 path = await _download(context, m.animation.file_id, tmp, ".mp4")
-                att = await asyncio.to_thread(vk_client.upload_video, token, group_id, path, text[:100] or "gif")
-                other_attachments.append(att)
+                other_uploads.append((vk_client.upload_video, token, group_id, path, text[:100] or "gif"))
             elif m.video_note:
                 path = await _download(context, m.video_note.file_id, tmp, ".mp4")
-                att = await asyncio.to_thread(vk_client.upload_video, token, group_id, path, text[:100] or "video")
-                other_attachments.append(att)
+                other_uploads.append((vk_client.upload_video, token, group_id, path, text[:100] or "video"))
             elif m.document:
                 doc = m.document
                 suffix = Path(doc.file_name or "file").suffix or ".bin"
@@ -61,9 +73,16 @@ async def _build_post(messages: list[Message], context: ContextTypes.DEFAULT_TYP
                 if doc.mime_type and doc.mime_type.startswith("image/"):
                     photo_paths.append(path)
                 else:
-                    att = await asyncio.to_thread(vk_client.upload_document, token, group_id, path, doc.file_name or "file")
-                    other_attachments.append(att)
+                    other_uploads.append((vk_client.upload_document, token, group_id, path, doc.file_name or "file"))
 
+        if not text.strip() and not photo_paths and not other_uploads:
+            raise EmptyPostError(
+                f"в посте нет ни текста, ни медиа, которые можно перенести в VK (в Telegram: {_describe_kinds(messages)})"
+            )
+
+        await asyncio.to_thread(moderation.check_photos, photo_paths)
+
+        other_attachments = [await asyncio.to_thread(*upload) for upload in other_uploads]
         photo_attachments = await asyncio.to_thread(vk_client.upload_photos, token, group_id, photo_paths) if photo_paths else []
         attachments = photo_attachments + other_attachments
 
